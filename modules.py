@@ -1600,28 +1600,42 @@ def joint_attn_call2_0(
         query = torch.cat([query, encoder_hidden_states_query_proj], dim=2)
         key = torch.cat([key, encoder_hidden_states_key_proj], dim=2)
         value = torch.cat([value, encoder_hidden_states_value_proj], dim=2)
-
     ####################################################################################################
     if hasattr(self, "store_attn_map"):
         hidden_states, attention_probs = scaled_dot_product_attention(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
         )
-
-        image_length = query.shape[2] - encoder_hidden_states_query_proj.shape[2]
-
-        # (4,24,4429,4429) -> (4,24,4096,333)
-        attention_probs = attention_probs[:,:,:image_length,image_length:].cpu()
         
-        self.attn_map = rearrange(
-            attention_probs,
-            'batch attn_head (height width) attn_dim -> batch attn_head height width attn_dim',
-            height = height
-        ) # (4, 24, 4096, 333) -> (4, 24, height, width, 333)
-        self.timestep = timestep[0].cpu().item() # TODO: int -> list
+        # Only process attention maps if we have encoder hidden states
+        if encoder_hidden_states is not None and encoder_hidden_states_query_proj is not None:
+            print(f'encoder_hidden_states_query_proj.shape: {encoder_hidden_states_query_proj.shape}')
+            print(f'query.shape: {query.shape}')
+            print(f"-"*100)
+            
+            image_length = query.shape[2] - encoder_hidden_states_query_proj.shape[2]
+
+            # Extract cross-attention probabilities (image->text attention)
+            attention_probs = attention_probs[:,:,:image_length,image_length:].cpu()
+            
+            self.attn_map = rearrange(
+                attention_probs,
+                'batch attn_head (height width) attn_dim -> batch attn_head height width attn_dim',
+                height = height
+            ) # (4, 24, 4096, 333) -> (4, 24, height, width, 333)
+            # Initialize timestep even if None
+            self.timestep = timestep[0].cpu().item() if timestep is not None else None
+        else:
+            # Handle self-attention case (no encoder hidden states)
+            print("No encoder hidden states available - skipping attention map storage")
+            self.attn_map = None
+            # Initialize timestep even if None
+            self.timestep = timestep[0].cpu().item() if timestep is not None else None
     else:
         hidden_states = F.scaled_dot_product_attention(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
         )
+        # Initialize timestep even in non-storage case
+        self.timestep = timestep[0].cpu().item() if timestep is not None else None
     ####################################################################################################
 
     # hidden_states = F.scaled_dot_product_attention(query, key, value, dropout_p=0.0, is_causal=False)
@@ -1680,9 +1694,9 @@ def flux_attn_call2_0(
     if attn.norm_k is not None:
         key = attn.norm_k(key)
 
-    # the attention in FluxSingleTransformerBlock does not use `encoder_hidden_states`
+    # Handle cross-attention (text + image)
     if encoder_hidden_states is not None:
-        # `context` projections.
+        # `context` projections for text tokens
         encoder_hidden_states_query_proj = attn.add_q_proj(encoder_hidden_states)
         encoder_hidden_states_key_proj = attn.add_k_proj(encoder_hidden_states)
         encoder_hidden_states_value_proj = attn.add_v_proj(encoder_hidden_states)
@@ -1702,44 +1716,62 @@ def flux_attn_call2_0(
         if attn.norm_added_k is not None:
             encoder_hidden_states_key_proj = attn.norm_added_k(encoder_hidden_states_key_proj)
 
-        # attention
+        # Concatenate text first, then image
+        # text tokens = encoder_hidden_states_query_proj, image tokens = query
         query = torch.cat([encoder_hidden_states_query_proj, query], dim=2)
         key = torch.cat([encoder_hidden_states_key_proj, key], dim=2)
         value = torch.cat([encoder_hidden_states_value_proj, value], dim=2)
 
+        text_length = encoder_hidden_states_query_proj.shape[2]
+        total_length = query.shape[2]
+        image_length = total_length - text_length
+    else:
+        text_length = 0
+        image_length = query.shape[2]
+
     if image_rotary_emb is not None:
         from diffusers.models.embeddings import apply_rotary_emb
-        
-
         query = apply_rotary_emb(query, image_rotary_emb)
         key = apply_rotary_emb(key, image_rotary_emb)
 
-    ####################################################################################################
+    # Compute attention
     if hasattr(self, "store_attn_map"):
         hidden_states, attention_probs = scaled_dot_product_attention(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
         )
 
-        image_length = query.shape[2] - encoder_hidden_states_query_proj.shape[2]
+        # Since we concatenated text then image along dim=2:
+        # text tokens: [0 : text_length]
+        # image tokens: [text_length : text_length + image_length]
 
-        # (4,24,4429,4429) -> (4,24,4096,333)
-        attention_probs = attention_probs[:,:,:image_length,image_length:].cpu()
-        
+        # If we want image-to-text attention maps (image queries attending to text keys):
+        # - Queries (image): tokens from text_length to text_length+image_length
+        # - Keys (text): tokens from 0 to text_length
+
+        attention_probs = attention_probs[:, :, text_length:, :text_length].cpu()
+
+        # Ensure height*width == image_length
+        # The rearrange requires that (height * width) == image_length
+        # print("height:", height)
+        # print("width:", width)
+        # print("image_length:", image_length)
+        height = 64
         self.attn_map = rearrange(
             attention_probs,
             'batch attn_head (height width) attn_dim -> batch attn_head height width attn_dim',
-            height = height
-        ) # (4, 24, 4096, 333) -> (4, 24, height, width, 333)
-        self.timestep = timestep[0].cpu().item() # TODO: int -> list
+            height=height
+        )
+        self.timestep = timestep[0].cpu().item() if timestep is not None else None
     else:
         hidden_states = F.scaled_dot_product_attention(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
         )
-    ####################################################################################################
+
     hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
     hidden_states = hidden_states.to(query.dtype)
 
     if encoder_hidden_states is not None:
+        # Split back into encoder (text) and image parts
         encoder_hidden_states, hidden_states = (
             hidden_states[:, : encoder_hidden_states.shape[1]],
             hidden_states[:, encoder_hidden_states.shape[1] :],
